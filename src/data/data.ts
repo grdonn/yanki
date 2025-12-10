@@ -1,4 +1,4 @@
-import { AssemblyPoint } from './types';
+import { AssemblyPoint } from '../../../types';
 
 export const SAFE_ASSEMBLY_POINTS: AssemblyPoint[] = [
   {

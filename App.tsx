@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   SafeAreaView,
   StyleSheet,
@@ -12,13 +12,13 @@ import {
   Modal,
   TextInput,
   ScrollView,
+  Linking,
+  NativeModules,
 } from 'react-native';
 import MapView, { Marker, PROVIDER_GOOGLE, Polyline } from 'react-native-maps';
 import { BleManager } from 'react-native-ble-plx';
 import Geolocation from '@react-native-community/geolocation';
-import Torch from 'react-native-torch';
 import Sound from 'react-native-sound';
-import SendSMS from 'react-native-sms';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const bleManager = new BleManager();
@@ -75,6 +75,9 @@ function App(): React.JSX.Element {
     longitudeDelta: 0.0421,
   });
 
+  const watchId = useRef<number | null>(null);
+  const locationFound = useRef(false);
+
   useEffect(() => {
     checkPermissionsAndLocate();
     loadProfile();
@@ -91,66 +94,140 @@ function App(): React.JSX.Element {
 
     return () => {
       s.release();
+      if (watchId.current !== null) {
+        Geolocation.clearWatch(watchId.current);
+      }
     };
   }, []);
 
   const checkPermissionsAndLocate = async () => {
     if (Platform.OS === 'android') {
-      const granted = await PermissionsAndroid.requestMultiple([
-        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
-        PermissionsAndroid.PERMISSIONS.CAMERA, // For Torch
-      ]);
+      try {
+        const granted = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
+          PermissionsAndroid.PERMISSIONS.CAMERA,
+        ]);
 
-      if (granted['android.permission.ACCESS_FINE_LOCATION'] === 'granted') {
-        getCurrentLocation();
+        if (granted['android.permission.ACCESS_FINE_LOCATION'] === 'granted') {
+          startLocationTracking();
+        } else {
+          Alert.alert("İzin Hatası", "Konum izni verilmedi.");
+        }
+      } catch (err) {
+        console.warn(err);
       }
+    } else {
+      startLocationTracking();
     }
   };
 
-  const getCurrentLocation = () => {
+  const updateLocationState = (lat: number, long: number) => {
+    locationFound.current = true;
+    setUserLocation({ latitude: lat, longitude: long });
+
+    let minDistance = Infinity;
+    let closest = null;
+
+    ASSEMBLY_POINTS.forEach(point => {
+      const dist = getDistanceFromLatLonInKm(lat, long, point.lat, point.long);
+      if (dist < minDistance) {
+        minDistance = dist;
+        closest = { ...point, distance: dist.toFixed(2) };
+      }
+    });
+
+    setNearestPoint(closest);
+
+    setRegion(prev => ({
+      ...prev,
+      latitude: lat,
+      longitude: long,
+    }));
+  };
+
+  /* FAIL-SAFE LOCATION STRATEGY */
+  const startLocationTracking = () => {
+    if (watchId.current !== null) Geolocation.clearWatch(watchId.current);
+
+    // 1. QUICK FIX: Try to get Low Accuracy Location immediately (Network/Wifi)
     Geolocation.getCurrentPosition(
       (position) => {
-        const userLat = position.coords.latitude;
-        const userLong = position.coords.longitude;
-        setUserLocation({ latitude: userLat, longitude: userLong });
-
-        let minDistance = Infinity;
-        let closest = null;
-
-        ASSEMBLY_POINTS.forEach(point => {
-          const dist = getDistanceFromLatLonInKm(userLat, userLong, point.lat, point.long);
-          if (dist < minDistance) {
-            minDistance = dist;
-            closest = { ...point, distance: dist.toFixed(2) };
-          }
-        });
-
-        setNearestPoint(closest);
-        setRegion({
-          latitude: userLat,
-          longitude: userLong,
-          latitudeDelta: 0.05,
-          longitudeDelta: 0.05,
-        });
+        console.log("Quick Fix Location Found:", position);
+        updateLocationState(position.coords.latitude, position.coords.longitude);
       },
-      (error) => console.log(error),
-      { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 }
+      (error) => console.log("Quick Fix Error:", error),
+      { enableHighAccuracy: false, timeout: 5000, maximumAge: 10000 }
+    );
+
+    // 2. TIMEOUT FALLBACK: If nothing found in 5s, default to Map Center (Istanbul)
+    setTimeout(() => {
+      if (!locationFound.current) {
+        console.log("Location Timeout: Falling back to Map Center");
+        // Default to initial region (Istanbul) so "Waiting" text Disappears
+        updateLocationState(41.0082, 28.9784);
+        Alert.alert("Konum Tahmini", "GPS sinyali zayıf. Varsayılan merkez nokta gösteriliyor.");
+      }
+    }, 5000);
+
+    // 3. CONTINUOUS WATCH (High Accuracy)
+    watchId.current = Geolocation.watchPosition(
+      (position) => {
+        updateLocationState(position.coords.latitude, position.coords.longitude);
+      },
+      (error) => {
+        console.log('Watch Position Error:', error);
+      },
+      {
+        enableHighAccuracy: true,
+        distanceFilter: 10,
+        interval: 5000,
+        fastestInterval: 2000
+      }
     );
   };
 
   // --- FEATURES ---
 
-  const toggleTorch = () => {
+  /*
+  const toggleTorch = async () => {
+    // Explicit permission check just in case
+    if (Platform.OS === 'android') {
+      const hasPerm = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.CAMERA);
+      if (!hasPerm) {
+        Alert.alert("İzin Gerekli", "Fener için kamera izni gerekiyor.");
+        return;
+      }
+    }
+
     try {
       const newState = !isTorchOn;
+      await Torch.switchState(newState);
       setIsTorchOn(newState);
-      Torch.switchState(newState);
-    } catch (err) {
-      Alert.alert("Hata", "Fener özelliği bu cihazda kullanılamıyor veya desteklenmiyor.");
-      console.warn(err);
+    } catch (e: any) {
+      console.warn('Torch Error:', e);
+      setIsTorchOn(false);
+      Alert.alert("GÜNCEL SÜRÜM", "Hata Detayı: " + e.message);
+    }
+  };
+  */
+
+  // --- NEW FLASHLIGHT IMPLEMENTATION ---
+  const { Flashlight } = NativeModules;
+
+  const toggleTorch = () => {
+    try {
+      if (!isTorchOn) {
+        Flashlight.turnOn();
+        setIsTorchOn(true);
+      } else {
+        Flashlight.turnOff();
+        setIsTorchOn(false);
+      }
+    } catch (e: any) {
+      Alert.alert("Hata", "Fener hatası: " + e.message);
       setIsTorchOn(false);
     }
   };
@@ -191,7 +268,6 @@ function App(): React.JSX.Element {
     bleManager.startDeviceScan(null, null, (error, device) => {
       if (device) setFoundDevices(prev => prev + 1);
     });
-    // Auto-stop after 15s
     setTimeout(() => {
       bleManager.stopDeviceScan();
       setIsScanning(false);
@@ -199,23 +275,24 @@ function App(): React.JSX.Element {
     }, 15000);
   };
 
-  const sendSOS = () => {
-    try {
-      const loc = userLocation
-        ? `Lat: ${userLocation.latitude}, Long: ${userLocation.longitude}`
-        : "Bilinmiyor";
-
-      SendSMS.send({
-        body: `GÜVENDEYİM! Konumum: ${loc}. Bu mesaj DepremMesh üzerinden gönderildi.`,
-        recipients: [], // User selects recipient
-        successTypes: ['sent', 'queued'] as any
-      }, (completed, cancelled, error) => {
-        if (error) console.log('SMS Error:', error);
-      });
-    } catch (err) {
-      Alert.alert("Hata", "SMS servisi başlatılamadı.");
-      console.warn(err);
+  const sendSafeSMS = () => {
+    if (!userLocation) {
+      Alert.alert("Konum Bekleniyor", "Lütfen mavi noktanın gelmesini bekleyin.");
+      return;
     }
+    const mapLink = `https://maps.google.com/?q=${userLocation.latitude},${userLocation.longitude}`;
+    const message = `ACİL DURUM! GÜVENDEYİM. Konumum: ${mapLink}`;
+
+    // NATIVE LINKING (Robust)
+    const url = `sms:?body=${encodeURIComponent(message)}`;
+
+    Linking.canOpenURL(url).then(supported => {
+      if (!supported) {
+        Alert.alert("Hata", "SMS uygulaması bulunamadı.");
+      } else {
+        return Linking.openURL(url);
+      }
+    }).catch(err => console.error('An error occurred', err));
   };
 
   // --- IDENTITY LOGIC ---
@@ -335,7 +412,7 @@ function App(): React.JSX.Element {
 
         <TouchableOpacity
           style={[styles.gridButton, styles.smsBtn]}
-          onPress={sendSOS}
+          onPress={sendSafeSMS}
         >
           <Text style={styles.btnEmoji}>💬</Text>
           <Text style={styles.btnLabel}>SMS GÖNDER</Text>
@@ -481,31 +558,21 @@ const styles = StyleSheet.create({
     alignContent: 'center',
   },
   gridButton: {
-    width: '48%', // Adjusted for 3 columns if needed, or stick to row wrap
-    height: '45%', // This might need adjustment if we add more buttons. Let's make current buttons match row logic.
-    // Actually, with 5 buttons, flexWrap will handle it. 
-    // Let's change width to '48%' for 2 cols, so 5th takes new row or we resize.
-    // User asked for a grid. 5 buttons.
-    // Let's set width to ~48% to have 2 per row. 5th will be on 3rd row or centered.
+    width: '48%',
+    height: '45%',
     borderRadius: 15,
     justifyContent: 'center',
     alignItems: 'center',
     marginBottom: 10,
     elevation: 3,
   },
-  // We need to override dimensions for proper 5-button layout.
-  // Ideally, re-style gridButton to fit better.
 
   inactiveBtn: { backgroundColor: '#333' },
   activeBtn: { backgroundColor: '#fff' },
   alarmBtn: { backgroundColor: '#FF3B30' },
   scanningBtn: { backgroundColor: '#32ADE6' },
   smsBtn: { backgroundColor: '#34C759' },
-  identityBtn: { backgroundColor: '#FF9500', width: '100%', marginTop: 5 }, // Make 5th button full width? Or just same. 
-  // User said "Grid Menu". 
-  // Let's make it full width or same size?
-  // Let's try making it 100% to separate it nicely or stick to grid. 
-  // Let's make it 100% for emphasis.
+  identityBtn: { backgroundColor: '#FF9500', width: '100%', marginTop: 5 },
 
   btnEmoji: { fontSize: 32, marginBottom: 5 },
   btnLabel: {
